@@ -96,6 +96,7 @@ def select_by_rules(query: str, models: List[str], rules: List[Dict]) -> str:
     # Default model
     default = rules[-1].get("default") if rules else None
     if default and default in models:
+        _safe_log(f"[Router] Using default: {default}")
         return default
     return models[0]
 
