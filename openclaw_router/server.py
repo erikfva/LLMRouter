@@ -44,7 +44,10 @@ except ImportError:
 
 class Message(BaseModel):
     role: str
-    content: Any  # Can be string or list (multimodal)
+    content: Optional[Any] = None  # Can be string or list (multimodal)
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+    function_call: Optional[Dict[str, Any]] = None
 
 
 class ChatRequest(BaseModel):
@@ -54,6 +57,9 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = 4096
     stream: Optional[bool] = False
     user: Optional[str] = None  # Optional user id (used for memory scoping if enabled)
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None
+    stream_options: Optional[Dict[str, Any]] = None
 
 
 # ============================================================
@@ -86,11 +92,19 @@ def normalize_messages(messages: List[Dict], model_id: str = "") -> List[Dict]:
     for msg in messages:
         role = msg.get("role", "user")
         content = normalize_content(msg.get("content", ""))
+        normalized_msg = {"role": role, "content": content}
+
+        if msg.get("tool_calls") is not None:
+            normalized_msg["tool_calls"] = msg["tool_calls"]
+        if msg.get("tool_call_id") is not None:
+            normalized_msg["tool_call_id"] = msg["tool_call_id"]
+        if msg.get("function_call") is not None:
+            normalized_msg["function_call"] = msg["function_call"]
 
         if role == "system":
             system_content = content
         else:
-            normalized.append({"role": role, "content": content})
+            normalized.append(normalized_msg)
 
     # Handle models without system role support
     if system_content and model_id in MODELS_WITHOUT_SYSTEM_ROLE:
@@ -131,11 +145,7 @@ def adjust_max_tokens(messages: List[Dict], model_id: str, requested_max: int) -
 
 def clean_response(result: Dict) -> Dict:
     """Clean response for OpenAI compatibility"""
-    usage_raw = result.get("usage", {})
-    usage = {}
-    for key in ["prompt_tokens", "completion_tokens", "total_tokens"]:
-        if key in usage_raw and usage_raw[key] is not None:
-            usage[key] = usage_raw[key]
+    usage = _clean_usage(result.get("usage"))
 
     cleaned = {
         "id": result.get("id", ""),
@@ -154,17 +164,65 @@ def clean_response(result: Dict) -> Dict:
             msg = choice["message"]
             cleaned_choice["message"] = {
                 "role": msg.get("role", "assistant"),
-                "content": msg.get("content", "")
+                "content": msg.get("content")
             }
+            if msg.get("tool_calls") is not None:
+                cleaned_choice["message"]["tool_calls"] = msg["tool_calls"]
+            if msg.get("function_call") is not None:
+                cleaned_choice["message"]["function_call"] = msg["function_call"]
         cleaned["choices"].append(cleaned_choice)
 
     return cleaned
 
 
+def _message_has_tool_calls(message: Optional[Dict[str, Any]]) -> bool:
+    return bool(message and (message.get("tool_calls") or message.get("function_call")))
+
+
+def _delta_has_tool_calls(delta: Optional[Dict[str, Any]]) -> bool:
+    return bool(delta and (delta.get("tool_calls") or delta.get("function_call")))
+
+
+def _clean_usage_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            cleaned_item = _clean_usage_value(item)
+            if cleaned_item is not None:
+                cleaned[key] = cleaned_item
+        return cleaned
+    if isinstance(value, list):
+        cleaned = []
+        for item in value:
+            cleaned_item = _clean_usage_value(item)
+            if cleaned_item is not None:
+                cleaned.append(cleaned_item)
+        return cleaned
+    if value is None:
+        return None
+    return value
+
+
+def _clean_usage(usage_raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not usage_raw:
+        return {}
+    if not isinstance(usage_raw, dict):
+        return {}
+    cleaned_usage = _clean_usage_value(usage_raw)
+    return cleaned_usage if isinstance(cleaned_usage, dict) else {}
+
+
+def _merge_stream_options(stream_options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    merged = dict(stream_options or {})
+    merged.setdefault("include_usage", True)
+    return merged
+
+
 def clean_streaming_chunk(chunk: Dict) -> Optional[Dict]:
     """Clean streaming chunk for OpenAI compatibility"""
     choices = chunk.get("choices", [])
-    if not choices:
+    usage = _clean_usage(chunk.get("usage"))
+    if not choices and not usage:
         return None
 
     cleaned = {
@@ -172,6 +230,10 @@ def clean_streaming_chunk(chunk: Dict) -> Optional[Dict]:
         "object": chunk.get("object", "chat.completion.chunk"),
         "choices": []
     }
+    if "model" in chunk:
+        cleaned["model"] = chunk["model"]
+    if usage:
+        cleaned["usage"] = usage
 
     for choice in choices:
         finish_reason = choice.get("finish_reason")
@@ -190,6 +252,10 @@ def clean_streaming_chunk(chunk: Dict) -> Optional[Dict]:
                     cleaned_delta["role"] = delta["role"]
                 if "content" in delta:
                     cleaned_delta["content"] = delta["content"]
+                if "tool_calls" in delta:
+                    cleaned_delta["tool_calls"] = delta["tool_calls"]
+                if "function_call" in delta:
+                    cleaned_delta["function_call"] = delta["function_call"]
                 cleaned_choice["delta"] = cleaned_delta
         else:
             cleaned_choice["delta"] = {}
@@ -251,7 +317,10 @@ class LLMBackend:
         self.config = config
 
     async def call(self, llm_name: str, messages: List[Dict], max_tokens: int = 4096,
-                   temperature: Optional[float] = None, stream: bool = False):
+                   temperature: Optional[float] = None, stream: bool = False,
+                   tools: Optional[List[Dict[str, Any]]] = None,
+                   tool_choice: Optional[Any] = None,
+                   stream_options: Optional[Dict[str, Any]] = None):
         """Call LLM API"""
         if llm_name not in self.config.llms:
             raise HTTPException(status_code=404, detail=f"LLM '{llm_name}' not found")
@@ -260,12 +329,23 @@ class LLMBackend:
         api_key = self.config.get_api_key(llm_config.provider, llm_config)
 
         if stream:
-            return self._call_streaming(llm_config, messages, max_tokens, temperature, api_key)
+            return self._call_streaming(
+                llm_config,
+                messages,
+                max_tokens,
+                temperature,
+                api_key,
+                tools,
+                tool_choice,
+                stream_options,
+            )
         else:
-            return await self._call_sync(llm_config, messages, max_tokens, temperature, api_key)
+            return await self._call_sync(llm_config, messages, max_tokens, temperature, api_key, tools, tool_choice)
 
     async def _call_sync(self, llm: LLMConfig, messages: List[Dict], max_tokens: int,
-                         temperature: Optional[float], api_key: Optional[str]) -> Dict:
+                         temperature: Optional[float], api_key: Optional[str],
+                         tools: Optional[List[Dict[str, Any]]] = None,
+                         tool_choice: Optional[Any] = None) -> Dict:
         """Synchronous API call"""
         normalized = normalize_messages(messages, llm.model_id)
         adjusted_max = adjust_max_tokens(normalized, llm.model_id, max_tokens)
@@ -285,6 +365,10 @@ class LLMBackend:
             }
             if temperature is not None:
                 body["temperature"] = temperature
+            if tools is not None:
+                body["tools"] = tools
+            if tool_choice is not None:
+                body["tool_choice"] = tool_choice
 
             resp = await client.post(
                 chat_url,
@@ -300,7 +384,10 @@ class LLMBackend:
             return clean_response(result)
 
     async def _call_streaming(self, llm: LLMConfig, messages: List[Dict], max_tokens: int,
-                              temperature: Optional[float], api_key: Optional[str]) -> AsyncGenerator:
+                          temperature: Optional[float], api_key: Optional[str],
+                          tools: Optional[List[Dict[str, Any]]] = None,
+                          tool_choice: Optional[Any] = None,
+                          stream_options: Optional[Dict[str, Any]] = None) -> AsyncGenerator:
         """Streaming API call"""
         normalized = normalize_messages(messages, llm.model_id)
         adjusted_max = adjust_max_tokens(normalized, llm.model_id, max_tokens)
@@ -316,10 +403,15 @@ class LLMBackend:
                 "model": llm.model_id,
                 "messages": normalized,
                 "max_tokens": adjusted_max,
-                "stream": True
+                "stream": True,
+                "stream_options": _merge_stream_options(stream_options),
             }
             if temperature is not None:
                 body["temperature"] = temperature
+            if tools is not None:
+                body["tools"] = tools
+            if tool_choice is not None:
+                body["tool_choice"] = tool_choice
 
             async with client.stream(
                 "POST",
@@ -380,7 +472,20 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatRequest):
-        messages = [{"role": m.role, "content": m.content} for m in request.messages]
+        print(f"============\n")
+        messages = []
+        for message in request.messages:
+            message_payload = {
+                "role": message.role,
+                "content": message.content,
+            }
+            if message.tool_calls is not None:
+                message_payload["tool_calls"] = message.tool_calls
+            if message.tool_call_id is not None:
+                message_payload["tool_call_id"] = message.tool_call_id
+            if message.function_call is not None:
+                message_payload["function_call"] = message.function_call
+            messages.append(message_payload)
 
         # Extract user query for routing (with optional media understanding)
         user_query = ""
@@ -422,9 +527,11 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
         if request.model == "auto" or request.model not in available_models:
             selected_model = await router.select_model(user_query, user=request.user)
             # ASCII-only log to avoid Windows GBK UnicodeEncodeError.
-            print(f"[Router] Query: '{user_query[:50]}...' -> {selected_model}")
+            # print(f"[Router] Query: '{user_query[:50]}...' -> {selected_model}")
+            print(f"[Router] Query: '{user_query}' -> {selected_model}")
         else:
             selected_model = request.model
+            print(f"[Specified] Query: '{user_query}' -> {selected_model}")
 
         # Handle streaming
         if request.stream:
@@ -433,13 +540,53 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 content_buffer = ""
                 buffered_chunks = []
 
+                def flush_buffered_prefix() -> Optional[str]:
+                    nonlocal prefix_sent, content_buffer, buffered_chunks
+                    if not buffered_chunks or prefix_sent:
+                        return None
+
+                    content_buffer = re.sub(r'^\[[\w\-\.]+\]\s*', '', content_buffer)
+                    first = buffered_chunks[0]
+                    try:
+                        first_json = first[6:] if first.startswith("data: ") else first
+                        first_data = json.loads(first_json.strip())
+                        if first_data.get("choices") and first_data["choices"][0].get("delta"):
+                            first_data["choices"][0]["delta"]["content"] = f"[{selected_model}] " + content_buffer
+                            prefix_sent = True
+                            buffered_chunks = []
+                            return f"data: {json.dumps(first_data)}\n\n"
+                    except:
+                        pass
+                    return None
+
                 try:
+                    prefix_disabled = False
+
                     stream_gen = await backend.call(
                         selected_model, messages, request.max_tokens,
-                        request.temperature, stream=True
+                        request.temperature, stream=True,
+                        tools=request.tools,
+                        tool_choice=request.tool_choice,
+                        stream_options=request.stream_options,
                     )
                     async for chunk in stream_gen:
                         if not config.show_model_prefix:
+                            yield chunk
+                            continue
+
+                        if prefix_disabled:
+                            if "[DONE]" in chunk:
+                                yield chunk
+                                continue
+                            try:
+                                json_str = chunk[6:] if chunk.startswith("data: ") else chunk
+                                data = json.loads(json_str.strip())
+                                cleaned = clean_streaming_chunk(data)
+                                if cleaned:
+                                    yield f"data: {json.dumps(cleaned)}\n\n"
+                                    continue
+                            except:
+                                pass
                             yield chunk
                             continue
 
@@ -447,15 +594,9 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                         if "[DONE]" in chunk:
                             # Flush buffer before DONE
                             if buffered_chunks and not prefix_sent:
-                                content_buffer = re.sub(r'^\[[\w\-\.]+\]\s*', '', content_buffer)
-                                first = buffered_chunks[0]
-                                try:
-                                    data = json.loads(first[6:]) if first.startswith("data: ") else {}
-                                    if data.get("choices") and data["choices"][0].get("delta"):
-                                        data["choices"][0]["delta"]["content"] = f"[{selected_model}] " + content_buffer
-                                        yield f"data: {json.dumps(data)}\n\n"
-                                except:
-                                    pass
+                                flushed_chunk = flush_buffered_prefix()
+                                if flushed_chunk:
+                                    yield flushed_chunk
                             yield chunk
                         else:
                             try:
@@ -464,9 +605,37 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                                 cleaned = clean_streaming_chunk(data)
 
                                 if cleaned:
+                                    if cleaned.get("usage") and not cleaned.get("choices"):
+                                        if buffered_chunks and not prefix_sent:
+                                            flushed_chunk = flush_buffered_prefix()
+                                            if flushed_chunk:
+                                                yield flushed_chunk
+                                        yield f"data: {json.dumps(cleaned)}\n\n"
+                                        continue
+
                                     choices = cleaned.get("choices", [])
                                     if choices and "delta" in choices[0]:
-                                        content = choices[0]["delta"].get("content", "")
+                                        delta = choices[0]["delta"]
+
+                                        if _delta_has_tool_calls(delta):
+                                            if buffered_chunks and not prefix_sent:
+                                                for buffered_chunk in buffered_chunks:
+                                                    try:
+                                                        buffered_json = buffered_chunk[6:] if buffered_chunk.startswith("data: ") else buffered_chunk
+                                                        buffered_data = json.loads(buffered_json.strip())
+                                                        buffered_cleaned = clean_streaming_chunk(buffered_data)
+                                                        if buffered_cleaned:
+                                                            yield f"data: {json.dumps(buffered_cleaned)}\n\n"
+                                                        else:
+                                                            yield buffered_chunk
+                                                    except:
+                                                        yield buffered_chunk
+                                                buffered_chunks = []
+                                            prefix_disabled = True
+                                            yield f"data: {json.dumps(cleaned)}\n\n"
+                                            continue
+
+                                        content = delta.get("content", "")
 
                                         if not prefix_sent:
                                             content_buffer += content
@@ -497,16 +666,18 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
         else:
             result = await backend.call(
                 selected_model, messages, request.max_tokens,
-                request.temperature, stream=False
+                request.temperature, stream=False,
+                tools=request.tools, tool_choice=request.tool_choice
             )
 
             # Add model prefix
             if config.show_model_prefix and result.get("choices"):
-                content = result["choices"][0].get("message", {}).get("content", "")
-                if content:
+                message = result["choices"][0].get("message", {})
+                content = message.get("content")
+                if content and not _message_has_tool_calls(message):
                     # Remove any existing prefix
                     content = re.sub(r'^\[[\w\-\.]+\]\s*', '', content)
-                    result["choices"][0]["message"]["content"] = f"[{selected_model}] {content}"
+                    message["content"] = f"[{selected_model}] {content}"
 
             result["model"] = selected_model
             return result
@@ -581,7 +752,9 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
             stream_gen = await backend.call(
                 selected_model, messages, request.max_tokens,
-                request.temperature, stream=True
+                request.temperature,
+                stream=True,
+                stream_options=request.stream_options,
             )
 
             async for chunk in stream_gen:
@@ -608,6 +781,22 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                         cleaned = clean_streaming_chunk(data_chunk)
 
                         if cleaned:
+                            if cleaned.get("usage") and not cleaned.get("choices"):
+                                if buffered_chunks and not prefix_sent:
+                                    content_buffer = re.sub(r'^\[[\w\-\.]+\]\s*', '', content_buffer)
+                                    first = buffered_chunks[0]
+                                    try:
+                                        first_data = json.loads(first[6:] if first.startswith("data: ") else first)
+                                        if first_data.get("choices") and first_data["choices"][0].get("delta"):
+                                            first_data["choices"][0]["delta"]["content"] = f"[{selected_model}] " + content_buffer
+                                            await websocket.send_text(f"data: {json.dumps(first_data)}\n\n")
+                                            prefix_sent = True
+                                            buffered_chunks = []
+                                    except:
+                                        pass
+                                await websocket.send_json(cleaned)
+                                continue
+
                             choices = cleaned.get("choices", [])
                             if choices and "delta" in choices[0]:
                                 content = choices[0]["delta"].get("content", "")

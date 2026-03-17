@@ -16,6 +16,7 @@ Pairing OpenClaw (channels + agents) with OpenClaw Router (OpenAI-compatible rou
 ## Features
 
 - OpenAI-compatible API: drop-in replacement for OpenAI-style clients (`/v1/chat/completions`).
+- HTTP tool calling pass-through: forwards OpenAI-compatible `tools` / `tool_choice` fields and preserves `tool_calls` in `/v1/chat/completions` responses. The Router does not execute tools itself.
 - Multiple routing strategies: built-in strategies plus the original LLMRouter ML-based routers.
 - Streaming support: end-to-end streaming responses.
 - Optional model prefix: add `[model_name]` to responses for debugging routing decisions.
