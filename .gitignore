@@ -21,6 +21,7 @@ wheels/
 *.egg
 
 # Virtual environments
+.venv/
 venv/
 ENV/
 env/
@@ -62,3 +63,4 @@ config.local.yaml
 
 # MkDocs build output
 site/
+.codex
