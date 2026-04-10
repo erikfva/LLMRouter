@@ -66,14 +66,95 @@ Remove `--route-only`, but first set `API_KEYS`.
 Example:
 
 ```bash
-export API_KEYS='{"NVIDIA":"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"}'
+export API_KEYS='{"NVIDIA":"your-nvidia-api-key"}'
 python -m llmrouter.cli.router_main infer \
   --router smallest_llm \
   --config configs/model_config_test/smallest_llm.yaml \
   --query "What is AI?"
 ```
 
-## 6. If you want to test training
+## 6. Run LLMRouter as an OpenAI-compatible router for OpenClaw
+
+Use the separate budget-aware serve config at [openclaw_router/config-budget-aware.yaml](/config/workspace/LLMRouter/openclaw_router/config-budget-aware.yaml).
+
+Set your NVIDIA key in the same shell where you will start the router:
+
+```bash
+export NVIDIA_API_KEY='your-nvidia-api-key'
+```
+
+Start the router server from the repo root:
+
+```bash
+cd /config/workspace/LLMRouter
+llmrouter serve --config openclaw_router/config-budget-aware.yaml
+```
+
+If `llmrouter` is not on `PATH`, use the module form:
+
+```bash
+cd /config/workspace/LLMRouter
+python3 -m llmrouter.cli.router_main serve --config openclaw_router/config-budget-aware.yaml
+```
+
+The router will listen at:
+
+```text
+http://127.0.0.1:8000/v1
+```
+
+Configure OpenClaw by merging this provider into `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "models": {
+    "providers": {
+      "openclaw": {
+        "api": "openai-completions",
+        "baseUrl": "http://127.0.0.1:8000/v1",
+        "apiKey": "not-needed",
+        "models": [
+          { "id": "auto", "name": "LLMRouter Budget Aware" }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "openclaw/auto" }
+    }
+  },
+  "gateway": {
+    "mode": "local"
+  }
+}
+```
+
+Then start OpenClaw normally. Requests sent to `openclaw/auto` will go to LLMRouter, and LLMRouter will pick a backend using the budget-aware config.
+
+Quick verification before starting OpenClaw:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "auto",
+    "messages": [
+      {"role": "user", "content": "Write a short hello world program in Python"}
+    ]
+  }'
+```
+
+Notes:
+- If OpenClaw and LLMRouter run in different containers or machines, replace `127.0.0.1` with the real reachable host/IP.
+- The budget-aware config uses NVIDIA remote models by default.
+- For local overflow capacity, uncomment the `local-overflow` block in [openclaw_router/config-budget-aware.yaml](/config/workspace/LLMRouter/openclaw_router/config-budget-aware.yaml) and point it to your local Ollama, vLLM, SGLang, or other OpenAI-compatible server.
+
+## 7. If you want to test training
 
 Start with a lightweight train script:
 
@@ -89,7 +170,7 @@ python -m llmrouter.cli.router_main train \
   --config configs/model_config_train/svmrouter.yaml
 ```
 
-## 7. Quickest query-dependent router test
+## 8. Quickest query-dependent router test
 
 `smallest_llm` and `largest_llm` ignore the question text. If you want routing to change by query, use a trained router such as `svmrouter`.
 
@@ -124,7 +205,7 @@ Expected behavior:
 - output may change across queries because this router uses query embeddings
 - actual model responses still require `API_KEYS`; `--route-only` only shows the selected model
 
-## 8. Check whether the router predicts models other than qwen
+## 9. Check whether the router predicts models other than qwen
 
 Use the helper script at [scripts/check_route_diversity.py](/config/workspace/LLMRouter/scripts/check_route_diversity.py) to test multiple representative queries from the bundled dataset without making any API calls.
 
