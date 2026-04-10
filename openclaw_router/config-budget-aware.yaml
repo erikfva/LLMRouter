@@ -1,0 +1,147 @@
+# ============================================================
+# OpenClaw Router Configuration
+# Budget-aware fallback profile for OpenClaw + LLMRouter
+# Start: llmrouter serve --config openclaw_router/config-budget-aware.yaml
+# ============================================================
+#
+# Design goals:
+# - Prefer compliant free/low-cost capacity first
+# - Avoid paid-provider assumptions in the default config
+# - Keep an optional local OpenAI-compatible backend ready as overflow
+# - Use deterministic routing instead of an extra LLM routing call
+#
+# Important:
+# - This config does NOT attempt quota evasion across multiple accounts.
+# - True retry-on-error failover is not implemented in the server yet.
+# - The practical fallback path here is "route many simple tasks to cheaper/free
+#   models, and optionally enable a local backend for overflow capacity."
+
+serve:
+  host: "0.0.0.0"
+  port: 8000
+  show_model_prefix: true
+
+# Routing strategies:
+# - rules: cheapest and most predictable for budget control
+# - round_robin: simple traffic spreading across enabled models
+# - llm: adds an extra routing-model API call, usually worse for tight budgets
+# - llmrouter: use a trained router if you already have routing data
+router:
+  strategy: rules
+  rules:
+    - keywords: ["code", "python", "javascript", "typescript", "bash", "sql", "debug", "bug", "refactor", "regex"]
+      model: nvidia-code
+    - keywords: ["analyze", "reason", "compare", "plan", "architecture", "tradeoff", "math", "proof"]
+      model: nvidia-strong
+    - keywords: ["image", "audio", "video", "vision", "transcribe", "screenshot"]
+      model: nvidia-fast
+    - keywords: ["hello", "hi", "thanks", "summarize", "rewrite", "translate"]
+      model: nvidia-fast
+    - default: nvidia-fast
+
+# API key resolution:
+# - Provider-level key from environment is preferred for safety.
+# - NVIDIA supports multiple keys in the code, but this config assumes compliant
+#   use of keys you are allowed to operate.
+api_keys:
+  nvidia: "${NVIDIA_API_KEY}"
+  # local: ""  # uncomment only if you use a local backend and want explicit empty auth
+
+# Optional routing memory.
+# Keep disabled by default to reduce complexity and avoid extra model-side bias.
+memory:
+  enabled: false
+  path: "${HOME}/.llmrouter/openclaw_memory.jsonl"
+  top_k: 10
+  retriever_model: "facebook/contriever-msmarco"
+  device: "cpu"
+  max_length: 256
+  max_query_chars: 500
+  max_prompt_chars: 200
+  per_user: false
+
+# Media understanding can consume additional upstream capacity.
+# Leave disabled unless you explicitly need multimodal requests.
+media:
+  enabled: false
+  api_key_env: "NVIDIA_API_KEY"
+  base_url: "https://integrate.api.nvidia.com/v1"
+  vision_model: "meta/llama-4-scout-17b-16e-instruct"
+  audio_model: "openai/whisper-large-v3"
+  image_prompt: "Describe this image concisely in 2-3 sentences."
+  video_prompt: "Describe what you see in these video frames."
+  video_max_frames: 4
+  max_description_chars: 500
+
+llms:
+  nvidia-fast:
+    provider: nvidia
+    provider_type: openai_compatible
+    model: meta/llama-3.1-8b-instruct
+    base_url: https://integrate.api.nvidia.com/v1
+    description: "Default low-cost/free-tier candidate for short chat, summaries, translation, and simple Q&A."
+    max_tokens: 1024
+    context_limit: 131072
+    input_price: 0.0
+    output_price: 0.0
+
+  nvidia-code:
+    provider: nvidia
+    provider_type: openai_compatible
+    model: nvidia/llama-3.3-nemotron-super-49b-v1
+    base_url: https://integrate.api.nvidia.com/v1
+    description: "Use for code generation, debugging, shell, and technical Q&A when the small model is likely to struggle."
+    max_tokens: 1024
+    context_limit: 32768
+    input_price: 0.0
+    output_price: 0.0
+
+  nvidia-strong:
+    provider: nvidia
+    provider_type: openai_compatible
+    model: meta/llama3-70b-instruct
+    base_url: https://integrate.api.nvidia.com/v1
+    description: "Reserve for reasoning-heavy prompts, comparisons, and harder analysis."
+    max_tokens: 1024
+    context_limit: 8192
+    input_price: 0.0
+    output_price: 0.0
+
+  # Optional local overflow backend.
+  # Enable this if you run Ollama, vLLM, SGLang, LM Studio, llama.cpp, etc.
+  # If your local server exposes an OpenAI-compatible /v1/chat/completions API,
+  # this gives you a compliant way to keep serving requests after remote quota
+  # pressure without depending on extra third-party accounts.
+  #
+  # local-overflow:
+  #   provider: local
+  #   provider_type: openai_compatible
+  #   model: qwen2.5:7b-instruct
+  #   base_url: http://127.0.0.1:11434/v1
+  #   auth_mode: none
+  #   local: true
+  #   chat_path: /chat/completions
+  #   description: "Local fallback backend for overflow or remote quota exhaustion."
+  #   max_tokens: 1024
+  #   context_limit: 32768
+  #   input_price: 0.0
+  #   output_price: 0.0
+
+# OpenClaw integration snippet:
+# {
+#   "models": {
+#     "providers": {
+#       "openclaw": {
+#         "api": "openai-completions",
+#         "baseUrl": "http://127.0.0.1:8000/v1",
+#         "apiKey": "not-needed",
+#         "models": [{"id": "auto", "name": "OpenClaw Router"}]
+#       }
+#     }
+#   },
+#   "agents": {
+#     "defaults": {
+#       "model": {"primary": "openclaw/auto"}
+#     }
+#   }
+# }
